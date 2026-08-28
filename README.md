@@ -2,18 +2,17 @@
 ### Stage 1: Video Capture & Frame Extraction Module for HAR Pipeline
 
 **Author:** Dheeraj  
-**Project:** ISRO Space Experiment Monitoring — Human Activity Recognition Pipeline  
+**Project:** Space Experiment Monitoring — Human Activity Recognition Pipeline  
 **Hackathon:** SIH
 
 ---
 
 ## 📌 What This Module Does
 
-This is **Stage 1** of the 6-stage HAR pipeline. It captures video from a webcam or a recorded file, preprocesses each frame (resizing, BGR→RGB conversion, optional CLAHE brightness normalization), and delivers clean frames via a thread-safe generator to the downstream detection module.
+This is **Stage 1** of the 6-stage HAR pipeline. It captures video from a live webcam or recorded video files, preprocesses each frame (resizing, BGR→RGB conversion, optional CLAHE brightness normalization), and delivers clean frames via a thread-safe generator to downstream detection models.
 
 ```
-[THIS MODULE: Dheeraj] → Object Detection (Udgeeth) → Action Recognition (Arpit) →
-Sequence Check (Shalini) → Correct/Wrong (Varshitha) → Dashboard
+[Video Input Module] → Object Detection → Action Recognition → Sequence Check → Verification → Dashboard
 ```
 
 ---
@@ -57,13 +56,13 @@ python test_video_input.py
 | `--height` | `480` | Output frame height |
 | `--skip` | `1` | Process every Nth frame (e.g. 2 = half FPS, 3 = third) to reduce ML load |
 | `--buffer` | `30` | Max frames to hold in the rolling buffer |
-| `--normalize` | Off | Enable CLAHE contrast/brightness normalization for low-light lab conditions |
+| `--normalize` | Off | Enable CLAHE contrast/brightness normalization for low-light conditions |
 
 ---
 
-## 🔌 How Teammates Use This Module
+## 🔌 How Downstream Modules Use This
 
-Udgeeth (or any downstream module) imports the `VideoInputModule` and loops over `get_frames()`:
+Downstream stages (such as Object Detection or Action Recognition) import `VideoInputModule` and loop over `get_frames()`:
 
 ```python
 from video_input import VideoInputModule
@@ -135,7 +134,7 @@ See [`integration_example.py`](integration_example.py) for complete multi-case e
 | File | Purpose |
 |---|---|
 | `video_input.py` | Core module — `VideoInputModule` class with threaded capture and preprocessing |
-| `integration_example.py` | Standalone script showing teammates how to connect their stages |
+| `integration_example.py` | Standalone script showing how downstream models connect |
 | `test_video_input.py` | Automated unit test suite (10/10 verified passing) |
 | `requirements.txt` | Minimal dependencies (`opencv-python`, `numpy`) |
 | `README.md` | Documentation and architecture guide |
