@@ -1,32 +1,20 @@
 """
 ==============================================================================
-VIDEO INPUT MODULE — Stage 1 of the HAR Pipeline
+VIDEO INPUT & MISSION TELEMETRY MODULE -- Stage 1 of the HAR Pipeline
 ==============================================================================
 
 Author:  Dheeraj
-Project: ISRO Space Experiment Monitoring (SIH Hackathon)
-Role:    Captures video from webcam or file, preprocesses frames,
-         and delivers them to the downstream detection stage (Udgeeth).
+Project: Space Experiment Monitoring (SIH Hackathon)
+Role:    Stage 1 Video Ingestion, Quality Analytics & Frame Delivery
 
-Pipeline Position:
-  [YOU] → Object+Activity Detection → Action Recognition →
-  Sequence Check → Correct/Wrong → Dashboard
+Core Capabilities:
+  1. Universal Ingestion: Webcams, Local Video Files, and RTSP / IP Camera Streams.
+  2. Zero-Latency Fresh Frame Mode: Eliminates backlog lag when downstream ML runs slowly.
+  3. Space Lab Motion-Adaptive Sampling: Conserves compute & power during idle experiment phases.
+  4. Real-Time Quality Analytics: Laplacian blur index, luminance analysis, and CLAHE enhancements.
+  5. Thread-Safe Ring Buffering: Non-blocking I/O with per-frame microsecond timestamps.
+  6. Standard & Rich Handoff: Simple (timestamp, frame) or advanced (frame, metadata).
 
-Usage:
-  # As a standalone demo (shows live webcam feed):
-  python video_input.py
-
-  # With a recorded video file:
-  python video_input.py --source path/to/video.mp4
-
-  # From another module (Udgeeth's detection code):
-  from video_input import VideoInputModule
-  vim = VideoInputModule(source=0)
-  vim.start()
-  for timestamp, frame in vim.get_frames():
-      # process frame here
-      pass
-  vim.stop()
 ==============================================================================
 """
 
@@ -36,316 +24,366 @@ import time
 import threading
 import argparse
 from collections import deque
+from dataclasses import dataclass, asdict
+from typing import Optional, Tuple, Generator, Union
+
+
+@dataclass
+class FrameMetadata:
+    """Rich telemetry metadata bundled with each captured frame."""
+    frame_id: int
+    timestamp: float
+    fps: float
+    latency_ms: float
+    motion_detected: bool
+    motion_score: float      # 0.0 to 100.0 scale
+    blur_score: float        # Laplacian variance (higher = sharper)
+    is_blurry: bool
+    brightness: float        # Mean luminance (0.0 to 255.0)
+    resolution: Tuple[int, int]
+    source_type: str
+
+    def to_dict(self) -> dict:
+        """Convert metadata to dictionary for JSON/Telemetry serialization."""
+        return asdict(self)
 
 
 class VideoInputModule:
     """
-    Stage 1 of the HAR pipeline — captures video, preprocesses frames,
-    and exposes them through a generator for downstream consumption.
-
-    This class handles:
-    1. Source selection (webcam or video file)
-    2. Threaded frame capture (non-blocking)
-    3. Frame preprocessing (resize, color conversion, normalization)
-    4. Buffered output with timestamps
+    High-performance Stage 1 Video Ingestion and Telemetry Engine.
     """
 
     def __init__(
         self,
-        source=0,
-        width=640,
-        height=480,
-        skip_frames=1,
-        buffer_size=30,
-        normalize=False,
+        source: Union[int, str] = 0,
+        width: int = 640,
+        height: int = 480,
+        skip_frames: int = 1,
+        buffer_size: int = 30,
+        normalize: bool = False,
+        zero_latency: bool = False,
+        motion_adaptive: bool = False,
+        detect_blur: bool = True,
+        blur_threshold: float = 80.0,
+        motion_threshold: float = 2.0,
     ):
         """
         Initialize the Video Input Module.
 
         Args:
-            source (int or str):
-                - 0 (or other int): Use webcam at that index.
-                  0 = default camera, 1 = second camera, etc.
-                - "path/to/video.mp4": Use a recorded video file.
-
-            width (int): Target frame width after resize. Default 640.
-            height (int): Target frame height after resize. Default 480.
-
-            skip_frames (int): Process every Nth frame. Default 1 (every frame).
-                - Set to 2 to halve the frame rate, 3 for one-third, etc.
-                - Useful to reduce load on the downstream detection model.
-
-            buffer_size (int): Max frames to hold in the rolling buffer.
-                - If the buffer is full, oldest frames are dropped.
-                - Default 30 (about 1 second at 30 FPS).
-
-            normalize (bool): Whether to apply CLAHE brightness normalization.
-                - Useful for low-light lab/experiment conditions.
-                - Default False (skip normalization for speed).
+            source: Webcam index (0, 1, ...), local video path ("video.mp4"),
+                    or RTSP / HTTP streaming URL ("http://192.168.1.10:8080/video").
+            width: Target frame width after resizing.
+            height: Target frame height after resizing.
+            skip_frames: Base frame skipping (process every Nth frame).
+            buffer_size: Maximum rolling buffer capacity.
+            normalize: Apply CLAHE contrast/lighting enhancement.
+            zero_latency: Discard stale buffered frames to guarantee real-time feed.
+            motion_adaptive: Dynamically throttle FPS when scene is idle.
+            detect_blur: Compute Laplacian sharpness variance for quality gating.
+            blur_threshold: Blur score cutoff below which frame is flagged as blurry.
+            motion_threshold: Sensitivity threshold for motion detection (percentage).
         """
-        # --- Configuration ---
         self.source = source
         self.width = width
         self.height = height
-        self.skip_frames = max(1, skip_frames)  # at least 1 (every frame)
+        self.skip_frames = max(1, skip_frames)
         self.buffer_size = buffer_size
         self.normalize = normalize
+        self.zero_latency = zero_latency
+        self.motion_adaptive = motion_adaptive
+        self.detect_blur = detect_blur
+        self.blur_threshold = blur_threshold
+        self.motion_threshold = motion_threshold
 
-        # --- Internal State ---
-        self.cap = None                         # OpenCV VideoCapture object
-        self.frame_buffer = deque(maxlen=buffer_size)  # rolling frame buffer
-        self._running = False                   # flag to control the capture thread
-        self._thread = None                     # background capture thread
-        self._lock = threading.Lock()           # thread safety for the buffer
-        self._frame_count = 0                   # total frames read from source
-        self._fps = 0.0                         # calculated FPS
+        # Source category classification
+        if isinstance(source, int):
+            self.source_type = "Webcam"
+        elif isinstance(source, str) and (source.startswith("http://") or source.startswith("https://") or source.startswith("rtsp://")):
+            self.source_type = "IP_Stream"
+        else:
+            self.source_type = "Video_File"
 
-        # --- CLAHE for brightness normalization (created once, reused) ---
+        # Internal State & Thread Safety
+        self.cap = None
+        self.frame_buffer = deque(maxlen=buffer_size)
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
+        self._frame_count = 0
+        self._processed_count = 0
+        self._fps = 0.0
+        self._prev_gray = None
+
+        # Pre-allocated CLAHE filter
         if self.normalize:
             self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         else:
             self._clahe = None
 
     # =========================================================================
-    #  PUBLIC METHODS — These are what you (and your teammates) call
+    #  PUBLIC API
     # =========================================================================
 
-    def start(self):
+    def start(self) -> bool:
         """
-        Open the video source and start capturing frames in the background.
-
-        Returns:
-            bool: True if the source was opened successfully, False otherwise.
+        Open video stream and start asynchronous background ingestion.
         """
-        # Open the video source
+        # Open source with OpenCV
         self.cap = cv2.VideoCapture(self.source)
 
+        # Optimize RTSP buffer size if network stream
+        if self.source_type == "IP_Stream":
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         if not self.cap.isOpened():
-            print(f"[ERROR] Could not open video source: {self.source}")
+            print(f"[ERROR] Failed to open video source: {self.source}")
             return False
 
-        # Print source info
-        src_type = "Webcam" if isinstance(self.source, int) else "Video File"
-        src_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-        src_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        src_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        native_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        native_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        native_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        print(f"[INFO] Source: {src_type} ({self.source})")
-        print(f"[INFO] Native resolution: {src_width}x{src_height} @ {src_fps:.1f} FPS")
-        print(f"[INFO] Output resolution: {self.width}x{self.height}")
-        print(f"[INFO] Frame skip: every {self.skip_frames} frame(s)")
-        print(f"[INFO] Normalization: {'ON' if self.normalize else 'OFF'}")
-        print(f"[INFO] Buffer size: {self.buffer_size} frames")
-        print()
+        print(f"[INFO] Ingestion Source : {self.source_type} ({self.source})")
+        print(f"[INFO] Native Stream    : {native_w}x{native_h} @ {native_fps:.1f} FPS")
+        print(f"[INFO] Target Output    : {self.width}x{self.height}")
+        print(f"[INFO] Zero Latency     : {'ENABLED' if self.zero_latency else 'OFF'}")
+        print(f"[INFO] Motion Adaptive  : {'ENABLED' if self.motion_adaptive else 'OFF'}")
+        print(f"[INFO] Blur Analytics   : {'ENABLED' if self.detect_blur else 'OFF'}")
+        print(f"[INFO] Lighting CLAHE   : {'ENABLED' if self.normalize else 'OFF'}")
 
-        # Start the background capture thread
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
 
-        print("[INFO] Capture started. Frames are being read in the background.")
         return True
 
-    def read_frame(self):
+    def read_frame(self, with_metadata: bool = False):
         """
-        Get the most recent preprocessed frame from the buffer.
-
-        Returns:
-            tuple: (timestamp, frame) if available, or (None, None) if buffer is empty.
-                - timestamp (float): Time the frame was captured (time.time()).
-                - frame (np.ndarray): Preprocessed frame as a NumPy array (RGB, uint8).
+        Retrieve the latest preprocessed frame from the buffer.
         """
         with self._lock:
             if len(self.frame_buffer) > 0:
-                return self.frame_buffer[-1]  # return the latest frame
-        return None, None
+                item = self.frame_buffer[-1]
+                if self.zero_latency:
+                    self.frame_buffer.clear()
+                if with_metadata:
+                    return item["frame"], item["meta"]
+                return item["meta"].timestamp, item["frame"]
+        return (None, None)
 
-    def get_frames(self):
+    def get_frames(self, with_metadata: bool = False) -> Generator:
         """
-        Generator that yields preprocessed frames one at a time.
+        Standard generator interface for downstream consumers.
 
-        THIS IS THE MAIN INTERFACE for downstream modules.
-        Udgeeth's detection code should call this in a for-loop:
-
-            vim = VideoInputModule(source=0)
-            vim.start()
-            for timestamp, frame in vim.get_frames():
-                detections = your_model.detect(frame)
-                ...
-
-        Yields:
-            tuple: (timestamp, frame)
-                - timestamp (float): Time the frame was captured.
-                - frame (np.ndarray): Preprocessed RGB frame as a NumPy array,
-                  shape (height, width, 3), dtype uint8.
+        Args:
+            with_metadata: If True, yields (frame, FrameMetadata).
+                           If False (default), yields (timestamp, frame) for 100% backward compatibility.
         """
-        last_timestamp = None
+        last_frame_id = -1
 
         while self._running:
+            item = None
             with self._lock:
                 if len(self.frame_buffer) > 0:
-                    timestamp, frame = self.frame_buffer[-1]
+                    latest = self.frame_buffer[-1]
+                    if latest["meta"].frame_id != last_frame_id:
+                        item = latest
+                        last_frame_id = latest["meta"].frame_id
+                        if self.zero_latency:
+                            self.frame_buffer.clear()
 
-                    # Only yield if this is a NEW frame (avoid duplicates)
-                    if timestamp != last_timestamp:
-                        last_timestamp = timestamp
-                        yield timestamp, frame
+            if item is not None:
+                if with_metadata:
+                    yield item["frame"], item["meta"]
                 else:
-                    # Buffer empty — wait a tiny bit before checking again
-                    pass
-
-            # Small sleep to prevent busy-waiting and hogging the CPU
-            time.sleep(0.001)
+                    yield item["meta"].timestamp, item["frame"]
+            else:
+                time.sleep(0.001)
 
     def stop(self):
-        """
-        Stop capturing and release all resources.
-        Always call this when you're done — cleans up the webcam/file handle.
-        """
+        """Cleanly terminate background thread and release hardware resources."""
         self._running = False
-
-        # Wait for the capture thread to finish
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
 
-        # Release the video source
         if self.cap is not None:
             self.cap.release()
             self.cap = None
 
-        print("[INFO] Video capture stopped and resources released.")
+        print("[INFO] Video Input Engine stopped. Resources released.")
 
-    def get_fps(self):
-        """Return the current measured FPS of the capture loop."""
+    def get_fps(self) -> float:
+        """Return real-time frame ingestion rate."""
         return self._fps
 
-    def is_running(self):
-        """Check if the capture loop is still active."""
+    def is_running(self) -> bool:
+        """Return True if active."""
         return self._running
 
     # =========================================================================
-    #  PRIVATE METHODS — Internal machinery, you don't call these directly
+    #  INTERNAL PROCESSING & ANALYTICS PIPELINE
     # =========================================================================
 
     def _capture_loop(self):
-        """
-        Background thread: continuously reads frames from the video source,
-        preprocesses them, and pushes them into the frame buffer.
-
-        This runs in a separate thread so the main thread (where detection
-        happens) is never blocked waiting for the camera.
-        """
-        frame_times = deque(maxlen=30)  # for FPS calculation
+        """Asynchronous background ingestion and telemetry analysis worker."""
+        frame_timestamps = deque(maxlen=30)
+        idle_counter = 0
 
         while self._running:
+            read_start = time.time()
             ret, raw_frame = self.cap.read()
 
-            # --- Handle end-of-video or camera disconnect ---
             if not ret or raw_frame is None:
-                if isinstance(self.source, int):
-                    # Webcam disconnected — stop
-                    print("[WARN] Webcam disconnected or frame read failed.")
+                if self.source_type == "Video_File":
+                    print("[INFO] End of video stream reached.")
                 else:
-                    # End of video file — stop
-                    print("[INFO] End of video file reached.")
+                    print("[WARN] Video stream disconnected or lost signal.")
                 self._running = False
                 break
 
             self._frame_count += 1
+            capture_time = time.time()
 
-            # --- Frame skipping: only process every Nth frame ---
+            # --- Base Frame Skip Filter ---
             if self._frame_count % self.skip_frames != 0:
                 continue
 
-            # --- Preprocess the frame ---
-            processed_frame = self._preprocess(raw_frame)
+            # --- Step 1: Preprocessing (Resize & Color Conversion) ---
+            resized_bgr = cv2.resize(raw_frame, (self.width, self.height))
+            gray = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2GRAY)
 
-            # --- Timestamp this frame ---
-            timestamp = time.time()
+            # --- Step 2: Motion Energy Detection ---
+            motion_score, motion_detected = self._detect_motion(gray)
 
-            # --- Push into the thread-safe buffer ---
+            # --- Step 3: Space Lab Adaptive Power-Saving Throttling ---
+            if self.motion_adaptive:
+                if not motion_detected:
+                    idle_counter += 1
+                    # In idle mode, only process 1 out of every 6 frames (~5 FPS)
+                    if idle_counter % 6 != 0:
+                        continue
+                else:
+                    idle_counter = 0
+
+            # --- Step 4: Quality & Blur Analytics ---
+            blur_score, is_blurry = self._evaluate_blur(gray)
+            mean_brightness = float(np.mean(gray))
+
+            # --- Step 5: CLAHE Lighting Normalization ---
+            if self.normalize and self._clahe is not None:
+                lab = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2LAB)
+                lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
+                rgb_frame = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+            else:
+                rgb_frame = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+
+            # --- Calculate Latency and FPS ---
+            frame_timestamps.append(capture_time)
+            if len(frame_timestamps) >= 2:
+                duration = frame_timestamps[-1] - frame_timestamps[0]
+                if duration > 0:
+                    self._fps = (len(frame_timestamps) - 1) / duration
+
+            self._processed_count += 1
+            latency_ms = (time.time() - read_start) * 1000.0
+
+            # --- Construct Rich Frame Metadata ---
+            meta = FrameMetadata(
+                frame_id=self._processed_count,
+                timestamp=capture_time,
+                fps=round(self._fps, 1),
+                latency_ms=round(latency_ms, 2),
+                motion_detected=motion_detected,
+                motion_score=round(motion_score, 2),
+                blur_score=round(blur_score, 1),
+                is_blurry=is_blurry,
+                brightness=round(mean_brightness, 1),
+                resolution=(self.width, self.height),
+                source_type=self.source_type,
+            )
+
+            # --- Thread-Safe Buffer Push ---
             with self._lock:
-                self.frame_buffer.append((timestamp, processed_frame))
+                self.frame_buffer.append({"frame": rgb_frame, "meta": meta})
 
-            # --- Calculate FPS ---
-            frame_times.append(timestamp)
-            if len(frame_times) >= 2:
-                elapsed = frame_times[-1] - frame_times[0]
-                if elapsed > 0:
-                    self._fps = (len(frame_times) - 1) / elapsed
+    def _detect_motion(self, current_gray: np.ndarray) -> Tuple[float, bool]:
+        """Compute pixel-level motion energy via frame differencing."""
+        if self._prev_gray is None:
+            self._prev_gray = current_gray
+            return 0.0, True
 
-    def _preprocess(self, frame):
-        """
-        Apply the preprocessing pipeline to a raw frame.
+        frame_diff = cv2.absdiff(self._prev_gray, current_gray)
+        _, thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)
+        non_zero_count = np.count_nonzero(thresh)
+        total_pixels = current_gray.shape[0] * current_gray.shape[1]
+        motion_score = (non_zero_count / total_pixels) * 100.0
 
-        Steps:
-        1. Resize to target dimensions (width x height)
-        2. Convert BGR → RGB (OpenCV reads as BGR, but most ML models want RGB)
-        3. Optionally normalize brightness using CLAHE
+        self._prev_gray = current_gray
+        motion_detected = motion_score >= self.motion_threshold
+        return motion_score, motion_detected
 
-        Args:
-            frame (np.ndarray): Raw BGR frame from OpenCV.
+    def _evaluate_blur(self, gray: np.ndarray) -> Tuple[float, bool]:
+        """Compute Laplacian variance to detect image blur/sharpness."""
+        if not self.detect_blur:
+            return 100.0, False
 
-        Returns:
-            np.ndarray: Preprocessed RGB frame, shape (height, width, 3).
-        """
-        # Step 1: Resize to configured resolution
-        frame = cv2.resize(frame, (self.width, self.height))
-
-        # Step 2: Convert BGR to RGB
-        #   OpenCV captures in BGR, but most detection/ML models expect RGB.
-        #   This conversion happens here so Udgeeth's code doesn't have to.
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Step 3: Optional brightness normalization (CLAHE)
-        #   Useful when the experiment is in a dimly-lit lab.
-        #   CLAHE = Contrast Limited Adaptive Histogram Equalization
-        if self.normalize and self._clahe is not None:
-            # CLAHE works on single channels, so convert to LAB color space,
-            # equalize the L (lightness) channel, then convert back.
-            lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
-            lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
-            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-        return frame
+        score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        is_blurry = score < self.blur_threshold
+        return score, is_blurry
 
 
 # =============================================================================
-#  DEMO — Run this file directly to test with your webcam
+#  CLI DEMO WITH HEADS-UP DISPLAY (HUD)
 # =============================================================================
+
+def draw_hud_overlay(frame_bgr: np.ndarray, meta: FrameMetadata) -> np.ndarray:
+    """Renders a sleek mission telemetry HUD overlay onto the display frame."""
+    hud = frame_bgr.copy()
+    h, w, _ = hud.shape
+
+    # Semi-transparent top telemetry banner
+    cv2.rectangle(hud, (0, 0), (w, 55), (20, 24, 30), -1)
+    cv2.addWeighted(hud, 0.75, frame_bgr, 0.25, 0, frame_bgr)
+
+    # Top Status Text
+    fps_color = (0, 255, 0) if meta.fps >= 20 else (0, 165, 255)
+    cv2.putText(frame_bgr, f"FPS: {meta.fps:.1f}", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fps_color, 2)
+    cv2.putText(frame_bgr, f"Latency: {meta.latency_ms:.1f}ms", (130, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+    # Motion Status Pill
+    motion_color = (0, 255, 100) if meta.motion_detected else (120, 120, 120)
+    motion_text = f"MOTION: {'ACTIVE' if meta.motion_detected else 'IDLE'} ({meta.motion_score:.1f}%)"
+    cv2.putText(frame_bgr, motion_text, (300, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, motion_color, 2)
+
+    # Blur / Quality Pill
+    blur_color = (0, 0, 255) if meta.is_blurry else (0, 255, 0)
+    blur_text = f"SHARPNESS: {meta.blur_score:.0f} {'[BLUR]' if meta.is_blurry else '[OK]'}"
+    cv2.putText(frame_bgr, blur_text, (15, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, blur_color, 1)
+
+    # Frame Counter
+    cv2.putText(frame_bgr, f"FRAME #{meta.frame_id}", (w - 140, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(frame_bgr, f"SRC: {meta.source_type}", (w - 140, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+    return frame_bgr
+
 
 def main():
-    """
-    Demo: Opens the webcam (or a video file), shows the live preprocessed
-    feed in a window, and prints FPS to the console.
-
-    Usage:
-        python video_input.py                          # webcam
-        python video_input.py --source video.mp4       # video file
-        python video_input.py --width 320 --height 240 # lower resolution
-        python video_input.py --normalize               # brightness normalization
-        python video_input.py --skip 3                  # process every 3rd frame
-    """
-    # --- Parse command-line arguments ---
-    parser = argparse.ArgumentParser(
-        description="Stage 1 — Video Input Module for HAR Pipeline"
-    )
-    parser.add_argument(
-        "--source", type=str, default="0",
-        help="Video source: 0 for webcam, or path to video file (default: 0)"
-    )
-    parser.add_argument("--width", type=int, default=640, help="Frame width (default: 640)")
-    parser.add_argument("--height", type=int, default=480, help="Frame height (default: 480)")
-    parser.add_argument("--skip", type=int, default=1, help="Process every Nth frame (default: 1)")
-    parser.add_argument("--buffer", type=int, default=30, help="Buffer size (default: 30)")
-    parser.add_argument("--normalize", action="store_true", help="Enable brightness normalization")
+    parser = argparse.ArgumentParser(description="Stage 1 -- Mission-Grade Video Input & Telemetry Engine")
+    parser.add_argument("--source", type=str, default="0", help="Webcam index (0), video file path, or RTSP/HTTP URL")
+    parser.add_argument("--width", type=int, default=640, help="Output width")
+    parser.add_argument("--height", type=int, default=480, help="Output height")
+    parser.add_argument("--skip", type=int, default=1, help="Process every Nth frame")
+    parser.add_argument("--buffer", type=int, default=30, help="Rolling buffer capacity")
+    parser.add_argument("--normalize", action="store_true", help="Enable CLAHE lighting normalization")
+    parser.add_argument("--zero-latency", action="store_true", help="Enable zero-lag fresh frame mode")
+    parser.add_argument("--motion-adaptive", action="store_true", help="Enable power-saving adaptive sampling")
+    parser.add_argument("--no-blur-detect", action="store_true", help="Disable blur analytics")
     args = parser.parse_args()
 
-    # Convert source: if it's a digit string, treat as webcam index
     source = int(args.source) if args.source.isdigit() else args.source
 
-    # --- Create and start the module ---
     vim = VideoInputModule(
         source=source,
         width=args.width,
@@ -353,64 +391,31 @@ def main():
         skip_frames=args.skip,
         buffer_size=args.buffer,
         normalize=args.normalize,
+        zero_latency=args.zero_latency,
+        motion_adaptive=args.motion_adaptive,
+        detect_blur=not args.no_blur_detect,
     )
 
     if not vim.start():
-        print("[ERROR] Failed to start. Check your webcam or file path.")
         return
 
-    print("[INFO] Press 'q' in the video window to quit.\n")
-
-    frame_count = 0
+    print("\n[INFO] Press 'q' in the display window to exit.\n")
 
     try:
-        for timestamp, frame in vim.get_frames():
-            frame_count += 1
-
-            # --- Convert RGB back to BGR for OpenCV display ---
-            # (Our module outputs RGB for ML models, but cv2.imshow expects BGR)
+        for frame, meta in vim.get_frames(with_metadata=True):
             display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            hud_frame = draw_hud_overlay(display_frame, meta)
 
-            # --- Draw FPS overlay on the display frame ---
-            fps_text = f"FPS: {vim.get_fps():.1f}"
-            cv2.putText(
-                display_frame, fps_text, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2
-            )
+            cv2.imshow("Space Mission HAR -- Stage 1 Telemetry HUD", hud_frame)
 
-            # --- Draw frame count ---
-            count_text = f"Frame: {frame_count}"
-            cv2.putText(
-                display_frame, count_text, (10, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-            )
-
-            # --- Draw resolution info ---
-            res_text = f"Size: {frame.shape[1]}x{frame.shape[0]}"
-            cv2.putText(
-                display_frame, res_text, (10, 95),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-            )
-
-            # --- Show the frame ---
-            cv2.imshow("HAR Pipeline - Stage 1 (Dheeraj)", display_frame)
-
-            # --- Print FPS to console every 30 frames ---
-            if frame_count % 30 == 0:
-                print(f"[FPS] {vim.get_fps():.1f} | Frames processed: {frame_count}")
-
-            # --- Check for 'q' key to quit ---
             if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("\n[INFO] 'q' pressed — stopping...")
                 break
 
     except KeyboardInterrupt:
-        print("\n[INFO] Ctrl+C pressed — stopping...")
-
+        pass
     finally:
         vim.stop()
         cv2.destroyAllWindows()
-        print(f"[INFO] Total frames processed: {frame_count}")
 
 
 if __name__ == "__main__":

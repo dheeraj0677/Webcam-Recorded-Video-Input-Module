@@ -1,177 +1,145 @@
 """
 ==============================================================================
-INTEGRATION EXAMPLE — How Teammates Use the Video Input Module
+INTEGRATION EXAMPLES -- Connecting Downstream AI Models to Stage 1
 ==============================================================================
 
-This file shows how Udgeeth (or any downstream module) connects to
-Dheeraj's VideoInputModule to receive preprocessed frames.
+This file shows the 4 integration patterns for downstream teammates
+(Object Detection, Action Recognition, and Sequence Check):
 
-The interface is simple:
-  1. Import VideoInputModule
-  2. Create an instance with your source (webcam or file)
-  3. Call start()
-  4. Loop over get_frames() — each iteration gives you a (timestamp, frame)
-  5. Call stop() when done
+  1. Simple Mode: Standard (timestamp, frame) for 100% backward compatibility
+  2. Mission Analytics Mode: (frame, FrameMetadata) with blur & motion telemetry
+  3. Zero-Latency Mode: Real-time guarantee for heavy/slow AI models
+  4. Space Lab Motion-Adaptive Mode: Power & compute saver for space stations
 
-That's it. Your detection model goes inside the loop.
 ==============================================================================
 """
 
+import time
 from video_input import VideoInputModule
 
 
-def example_1_basic_webcam():
+def example_1_simple_backward_compatible():
     """
-    BASIC EXAMPLE: Read from webcam, print frame info.
-    This is the simplest possible usage.
+    PATTERN 1: Standard Simple Mode
+    Backward-compatible with original 3-line loop.
     """
-    print("=== Example 1: Basic Webcam ===\n")
-
-    # Create the module — source=0 means default webcam
-    vim = VideoInputModule(source=0, width=640, height=480)
-
-    # Start capturing
-    if not vim.start():
-        print("Could not start webcam!")
-        return
-
-    # Read frames — this is where Udgeeth's detection would go
-    frame_count = 0
-    for timestamp, frame in vim.get_frames():
-        frame_count += 1
-
-        # =====================================================
-        # UDGEETH: Put your detection model call here!
-        #
-        #   detections = your_model.detect(frame)
-        #   for obj in detections:
-        #       print(f"Detected: {obj.label} ({obj.confidence:.2f})")
-        #
-        # The 'frame' is already:
-        #   - Resized to 640x480
-        #   - Converted to RGB
-        #   - A NumPy array, shape (480, 640, 3), dtype uint8
-        # =====================================================
-
-        print(f"Frame {frame_count}: shape={frame.shape}, timestamp={timestamp:.3f}")
-
-        # Stop after 100 frames for this demo
-        if frame_count >= 100:
-            break
-
-    vim.stop()
-    print(f"\nProcessed {frame_count} frames.\n")
-
-
-def example_2_video_file():
-    """
-    VIDEO FILE EXAMPLE: Read from a recorded .mp4 file.
-    Change the path to your actual video file.
-    """
-    print("=== Example 2: Video File ===\n")
-
-    vim = VideoInputModule(
-        source="experiment_recording.mp4",  # <-- change this to your file
-        width=640,
-        height=480,
-        skip_frames=2,     # process every 2nd frame (halves workload)
-        normalize=True,    # brighten dark footage
-    )
-
-    if not vim.start():
-        print("Could not open video file! Check the path.")
-        return
-
-    for timestamp, frame in vim.get_frames():
-        # Your processing here...
-        print(f"Frame shape: {frame.shape}, FPS: {vim.get_fps():.1f}")
-
-    vim.stop()
-    print("Video file processing complete.\n")
-
-
-def example_3_detection_integration():
-    """
-    FULL INTEGRATION SKELETON — This is how the complete pipeline connection
-    between Dheeraj (Stage 1) and Udgeeth (Stage 2) would look.
-
-    Udgeeth: copy this pattern and replace the dummy function with your
-    actual YOLO/detection model.
-    """
-    print("=== Example 3: Detection Integration Skeleton ===\n")
-
-    # --- Dheeraj's module (Stage 1) ---
+    print("\n=== Pattern 1: Standard Simple Mode ===")
     vim = VideoInputModule(source=0, width=640, height=480)
 
     if not vim.start():
         return
 
     frame_count = 0
-
     for timestamp, frame in vim.get_frames():
         frame_count += 1
+        # frame is RGB NumPy array: shape (480, 640, 3)
+        # Udgeeth's Object Detection / YOLO model goes here:
+        # results = detector.detect(frame)
+        print(f"Received frame #{frame_count} @ {timestamp:.3f}s | Shape: {frame.shape}")
 
-        # --- Udgeeth's detection (Stage 2) ---
-        # Replace this dummy function with your real model:
-        #
-        #   from detection_module import ObjectDetector
-        #   detector = ObjectDetector("yolov8n.pt")
-        #   results = detector.detect(frame)
-        #
-        detections = dummy_detect(frame)
-
-        # --- Arpit's action recognition (Stage 3) ---
-        # action = recognize_action(frame, detections)
-
-        # --- Shalini's sequence check (Stage 4) ---
-        # is_correct = check_sequence(action)
-
-        # --- Varshitha's result (Stage 5) ---
-        # result = classify_step(is_correct)
-
-        # Print progress
-        if frame_count % 30 == 0:
-            print(f"Processed {frame_count} frames | FPS: {vim.get_fps():.1f}")
-
-        if frame_count >= 150:
+        if frame_count >= 30:
             break
 
     vim.stop()
-    print(f"\nDone. Total frames: {frame_count}\n")
 
 
-def dummy_detect(frame):
+def example_2_rich_metadata_telemetry():
     """
-    Placeholder detection function.
-    Udgeeth will replace this with the real object detection model.
-
-    Args:
-        frame: RGB numpy array, shape (H, W, 3)
-
-    Returns:
-        list: Detected objects (empty for now)
+    PATTERN 2: Rich Metadata & Quality Gate
+    Filter out blurry frames automatically before running heavy AI models.
     """
-    return []
+    print("\n=== Pattern 2: Rich Metadata & Quality Gate ===")
+    vim = VideoInputModule(source=0, width=640, height=480, detect_blur=True)
+
+    if not vim.start():
+        return
+
+    frame_count = 0
+    for frame, meta in vim.get_frames(with_metadata=True):
+        frame_count += 1
+
+        # QUALITY GATE: Skip blurry frames to prevent false AI detections
+        if meta.is_blurry:
+            print(f"[SKIP] Frame #{meta.frame_id} flagged as BLURRY (Score: {meta.blur_score:.1f})")
+            continue
+
+        # AI INFERENCE: Process only high-quality frames
+        print(f"[PROCESS] Frame #{meta.frame_id} | FPS: {meta.fps} | "
+              f"Motion: {'ACTIVE' if meta.motion_detected else 'IDLE'} ({meta.motion_score:.1f}%) | "
+              f"Sharpness: {meta.blur_score:.1f}")
+
+        if frame_count >= 30:
+            break
+
+    vim.stop()
 
 
-# =============================================================================
-#  Run any of the examples
-# =============================================================================
+def example_3_zero_latency_mode():
+    """
+    PATTERN 3: Zero-Latency Mode for Slow AI Inference
+    Guarantees no lag backlog even when the AI model runs at 5 FPS.
+    """
+    print("\n=== Pattern 3: Zero-Latency Mode for Heavy Models ===")
+    vim = VideoInputModule(source=0, width=640, height=480, zero_latency=True)
+
+    if not vim.start():
+        return
+
+    frame_count = 0
+    for timestamp, frame in vim.get_frames():
+        frame_count += 1
+
+        # Simulate a heavy deep learning model taking 150ms per frame (~6 FPS)
+        time.sleep(0.15)
+
+        # In Zero-Latency mode, the next frame will be the FRESH live camera frame,
+        # never an old queued frame from 2 seconds ago.
+        print(f"Processed frame #{frame_count} (Zero-Lag Guaranteed)")
+
+        if frame_count >= 15:
+            break
+
+    vim.stop()
+
+
+def example_4_space_lab_motion_adaptive():
+    """
+    PATTERN 4: Space Lab Motion-Adaptive Sampling
+    Automatically downsamples when experiment workspace is idle.
+    """
+    print("\n=== Pattern 4: Space Lab Motion-Adaptive Sampling ===")
+    vim = VideoInputModule(source=0, width=640, height=480, motion_adaptive=True)
+
+    if not vim.start():
+        return
+
+    frame_count = 0
+    for frame, meta in vim.get_frames(with_metadata=True):
+        frame_count += 1
+        state = "ACTIVE EXPERIMENT" if meta.motion_detected else "IDLE (POWER SAVING)"
+        print(f"Frame #{meta.frame_id} | State: {state} | Energy: {meta.motion_score:.1f}%")
+
+        if frame_count >= 30:
+            break
+
+    vim.stop()
+
+
 if __name__ == "__main__":
-    print("Choose an example to run:")
-    print("  1 — Basic webcam capture")
-    print("  2 — Video file processing")
-    print("  3 — Detection integration skeleton")
-    print()
+    print("Choose an integration pattern to test:")
+    print("  1 - Standard Simple Mode (Backward Compatible)")
+    print("  2 - Rich Metadata & Quality Gate (Skip Blurry Frames)")
+    print("  3 - Zero-Latency Mode (For Slow AI Inference)")
+    print("  4 - Space Lab Motion-Adaptive Mode (Power Saver)")
 
-    choice = input("Enter 1, 2, or 3: ").strip()
-
+    choice = input("\nEnter choice (1-4): ").strip()
     if choice == "1":
-        example_1_basic_webcam()
+        example_1_simple_backward_compatible()
     elif choice == "2":
-        example_2_video_file()
+        example_2_rich_metadata_telemetry()
     elif choice == "3":
-        example_3_detection_integration()
+        example_3_zero_latency_mode()
+    elif choice == "4":
+        example_4_space_lab_motion_adaptive()
     else:
-        print("Invalid choice. Running Example 1 by default.")
-        example_1_basic_webcam()
+        example_1_simple_backward_compatible()
